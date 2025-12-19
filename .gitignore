@@ -1,0 +1,6 @@
+# Gemini için geçici izin
+__pycache__/
+*.pyc
+venv/
+chrome_profile/
+*.log

@@ -1,0 +1,5 @@
+python-telegram-bot>=20.0
+selenium>=4.0
+webdriver-manager
+Pillow
+requests
