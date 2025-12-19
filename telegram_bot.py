@@ -1,12 +1,15 @@
 """
 Telegram Bot Modülü
 Kullanıcıdan gelen fotoğrafları dinler, Gemini ile işler ve sonucu geri gönderir.
+Modern ve detaylı adım adım geri bildirimler sağlar.
 """
 
 import os
-from typing import Optional
+import time
+from typing import Optional, Callable
+from dataclasses import dataclass
 
-from telegram import Update
+from telegram import Update, Message
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,6 +27,104 @@ from services.gemini_service import GeminiService
 logger = get_logger(__name__)
 
 
+@dataclass
+class StepInfo:
+    """İşlem adımı bilgisi"""
+    emoji: str
+    name: str
+    done_emoji: str = "✅"
+
+
+class ProgressTracker:
+    """Modern ilerleme takipçisi"""
+    
+    STEPS = [
+        StepInfo("📥", "Dosya indiriliyor"),
+        StepInfo("🌐", "Chrome başlatılıyor"),
+        StepInfo("🔗", "Gemini'ye bağlanılıyor"),
+        StepInfo("📤", "Fotoğraf yükleniyor"),
+        StepInfo("🧠", "AI analiz yapıyor"),
+        StepInfo("⏳", "Yanıt bekleniyor"),
+        StepInfo("💬", "Prompt alındı"),
+        StepInfo("🆕", "Yeni sohbet açılıyor"),
+        StepInfo("🎨", "Görsel oluşturuluyor"),
+        StepInfo("⬇️", "Görsel indiriliyor"),
+        StepInfo("📨", "Sonuç gönderiliyor"),
+    ]
+    
+    def __init__(self, message: Message):
+        self.message = message
+        self.current_step = 0
+        self.start_time = time.time()
+        self.extra_info = ""
+    
+    def _build_message(self) -> str:
+        """İlerleme mesajını oluştur"""
+        lines = ["🤖 **AI Görsel Otomasyon**", "━" * 24, ""]
+        
+        for i, step in enumerate(self.STEPS):
+            if i < self.current_step:
+                # Tamamlanmış adım
+                lines.append(f"{step.done_emoji} ~~{step.name}~~")
+            elif i == self.current_step:
+                # Aktif adım
+                lines.append(f"▶️ **{step.name}...**")
+            else:
+                # Bekleyen adım
+                lines.append(f"⬜ {step.name}")
+        
+        # Ekstra bilgi
+        if self.extra_info:
+            lines.append("")
+            lines.append(f"💡 _{self.extra_info}_")
+        
+        # Geçen süre
+        elapsed = int(time.time() - self.start_time)
+        lines.append("")
+        lines.append(f"⏱️ Geçen süre: {elapsed}s")
+        
+        return "\n".join(lines)
+    
+    async def update(self, step: int, extra_info: str = ""):
+        """Adımı güncelle"""
+        self.current_step = step
+        self.extra_info = extra_info
+        
+        try:
+            await self.message.edit_text(
+                self._build_message(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.debug(f"Mesaj güncellenemedi: {e}")
+    
+    async def complete(self, success: bool, details: str = ""):
+        """İşlemi tamamla"""
+        elapsed = int(time.time() - self.start_time)
+        
+        if success:
+            text = (
+                "🎉 **İŞLEM TAMAMLANDI!**\n"
+                "━" * 24 + "\n\n"
+                "✅ Tüm adımlar başarıyla tamamlandı\n\n"
+                f"⏱️ Toplam süre: **{elapsed} saniye**\n\n"
+                "📎 Görseliniz aşağıda 👇"
+            )
+        else:
+            text = (
+                "❌ **İŞLEM BAŞARISIZ**\n"
+                "━" * 24 + "\n\n"
+                f"⚠️ {details}\n\n"
+                f"⏱️ Geçen süre: {elapsed}s\n\n"
+                "🔄 Tekrar denemek için yeni bir fotoğraf gönderin."
+            )
+        
+        try:
+            await self.message.edit_text(text, parse_mode="Markdown")
+        except Exception as e:
+            logger.debug(f"Tamamlama mesajı güncellenemedi: {e}")
+
+
 class TelegramBotService:
     """Telegram bot servisi"""
     
@@ -32,10 +133,12 @@ class TelegramBotService:
         self.gemini_service: Optional[GeminiService] = None
         self.prompt_text = config.get_prompt_text()
     
-    def ensure_browser(self) -> bool:
+    async def ensure_browser(self, progress: ProgressTracker) -> bool:
         """Tarayıcının çalıştığından emin ol"""
         if self.browser_manager and self.browser_manager.is_running:
             return True
+        
+        await progress.update(1, "Chrome profili yükleniyor...")
         
         try:
             self.browser_manager = BrowserManager(
@@ -55,16 +158,58 @@ class TelegramBotService:
             logger.error(f"Tarayıcı başlatılamadı: {e}")
             return False
     
-    def process_image(self, image_path: str) -> Optional[str]:
-        """Fotoğrafı işle ve sonuç görselini döndür"""
-        if not self.ensure_browser():
+    async def process_image_with_progress(
+        self,
+        image_path: str,
+        progress: ProgressTracker
+    ) -> Optional[str]:
+        """Fotoğrafı işle ve ilerlemeyi takip et"""
+        
+        # Tarayıcı kontrolü
+        if not await self.ensure_browser(progress):
             return None
         
         try:
-            return self.gemini_service.full_workflow(
-                image_path=image_path,
-                prompt_text=self.prompt_text
-            )
+            # Adım 2: Gemini'ye bağlan
+            await progress.update(2, "Gemini sayfası açılıyor...")
+            self.gemini_service.go_to_gemini()
+            
+            # Adım 3: Fotoğraf yükle
+            await progress.update(3, "Fotoğraf clipboard'a kopyalanıyor...")
+            self.gemini_service.upload_image(image_path)
+            
+            # Adım 4: Analiz başlat
+            await progress.update(4, "Prompt gönderiliyor...")
+            self.gemini_service.send_prompt(self.prompt_text)
+            
+            # Adım 5: Yanıt bekle
+            await progress.update(5, "Gemini düşünüyor...")
+            self.gemini_service.wait_for_response(timeout=120)
+            
+            # Adım 6: Prompt al
+            await progress.update(6, "AI prompt alınıyor...")
+            response_text = self.gemini_service.get_response_text()
+            if not response_text:
+                raise AutomationError("Yanıt alınamadı")
+            
+            # Adım 7: Yeni sohbet
+            await progress.update(7, "Görsel oluşturma için hazırlanıyor...")
+            self.gemini_service.start_new_chat()
+            
+            # Adım 8: Görsel oluştur
+            await progress.update(8, "Görsel oluşturma promptu gönderiliyor...")
+            self.gemini_service.send_prompt(response_text)
+            
+            # Adım 9: Görsel bekle
+            await progress.update(9, "AI görsel oluşturuyor (bu biraz sürebilir)...")
+            self.gemini_service.wait_for_image_generation(timeout=180)
+            
+            # Adım 10: İndir
+            await progress.update(9, "Görsel indiriliyor...")
+            result = self.gemini_service.download_generated_image()
+            
+            return result
+            
         except AutomationError as e:
             logger.error(f"İşlem hatası: {e}")
             return None
@@ -83,25 +228,39 @@ bot_service = TelegramBotService()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Bot başlangıç komutu"""
-    await update.message.reply_text(
-        "🤖 Merhaba! Ben AI Görüntü Otomasyon Botuyum.\n\n"
-        "📸 Bana bir fotoğraf gönder, ben:\n"
-        "1. Gemini'ye yükleyip AI prompt oluşturacağım\n"
-        "2. O promptla yeni bir görsel oluşturacağım\n"
-        "3. Sonucu sana göndereceğım\n\n"
-        "Komutlar:\n"
-        "/start - Bu mesajı göster\n"
-        "/status - Bot durumunu kontrol et"
-    )
+    welcome_text = """
+🤖 **AI Görüntü Otomasyon Botu**
+━━━━━━━━━━━━━━━━━━━━━━
+
+📸 **Nasıl Çalışır?**
+1️⃣ Bana bir fotoğraf gönder
+2️⃣ AI fotoğrafı analiz eder
+3️⃣ Detaylı bir prompt oluşturur
+4️⃣ Bu promptla yeni görsel üretir
+5️⃣ Sonucu sana gönderir
+
+⚡ **Komutlar:**
+/start - Bu mesajı göster
+/status - Bot durumunu kontrol et
+
+🎯 Hadi başlayalım! Bir fotoğraf gönder.
+"""
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Bot durumunu kontrol et"""
-    await update.message.reply_text(
-        f"📊 Bot Durumu:\n"
-        f"🌐 Tarayıcı: {bot_service.browser_status}\n"
-        f"📁 Fotoğraf Klasörü: {config.IMAGES_DIR}"
-    )
+    status_text = f"""
+📊 **Bot Durumu**
+━━━━━━━━━━━━━━━━
+
+🌐 Tarayıcı: {bot_service.browser_status}
+📁 Klasör: `{config.IMAGES_DIR}`
+🔗 Gemini: {config.GEMINI_URL}
+
+✅ Bot aktif ve fotoğraf bekliyor!
+"""
+    await update.message.reply_text(status_text, parse_mode="Markdown")
 
 
 async def process_input_image(
@@ -111,54 +270,58 @@ async def process_input_image(
     file_name: str
 ):
     """Ortak işlem fonksiyonu: fotoğraf ve belge için"""
-    status_msg = await update.message.reply_text("📥 Dosya alınıyor...")
+    
+    # İlerleme takipçisi başlat
+    status_msg = await update.message.reply_text(
+        "🚀 **İşlem başlatılıyor...**",
+        parse_mode="Markdown"
+    )
+    progress = ProgressTracker(status_msg)
     
     try:
-        # Dosyayı indir
+        # Adım 0: Dosyayı indir
+        await progress.update(0, "Telegram'dan indiriliyor...")
         file_path = os.path.join(config.IMAGES_DIR, file_name)
         await file_obj.download_to_drive(file_path)
         logger.info(f"Fotoğraf kaydedildi: {file_path}")
         
-        await status_msg.edit_text("✅ İndirildi. Chrome kontrol ediliyor...")
-        
-        await status_msg.edit_text(
-            "🔄 Gemini İŞLEMİ BAŞLATILIYOR...\n"
-            "1. Fotoğraf Analizi\n"
-            "2. Prompt Üretimi\n"
-            "3. Görsel Oluşturma"
+        # İşlemi başlat
+        result_image = await bot_service.process_image_with_progress(
+            file_path, progress
         )
         
-        # Tam akışı çalıştır
-        result_image = bot_service.process_image(file_path)
-        
         if result_image and os.path.exists(result_image):
-            await status_msg.edit_text("✅ Görsel oluşturuldu! Yükleniyor...")
+            # Adım 10: Gönder
+            await progress.update(10, "Telegram'a yükleniyor...")
+            
+            # Tamamlandı mesajı
+            await progress.complete(success=True)
             
             # Dosya olarak gönder (kalite bozulmaz)
             with open(result_image, 'rb') as f:
                 await update.message.reply_document(
                     document=f,
                     filename=os.path.basename(result_image),
-                    caption="🎨 İşte sonucunuz!"
+                    caption="🎨 **Orijinal Kalite**\nTam çözünürlüklü görsel",
+                    parse_mode="Markdown"
                 )
             
             # Önizleme gönder
             with open(result_image, 'rb') as f:
-                await update.message.reply_photo(photo=f)
-            
-            await status_msg.edit_text("✅ İşlem başarıyla tamamlandı.")
+                await update.message.reply_photo(
+                    photo=f,
+                    caption="👆 _Önizleme - Orijinal için dosyaya bakın_",
+                    parse_mode="Markdown"
+                )
         else:
-            await status_msg.edit_text(
-                "❌ Üzgünüm, görsel oluşturulamadı.\n"
-                "Olası sebepler:\n"
-                "- Gemini görseli oluşturamadı\n"
-                "- İndirme zaman aşımına uğradı\n"
-                "- İçerik politikası engeli"
+            await progress.complete(
+                success=False,
+                details="Görsel oluşturulamadı veya indirilemedi"
             )
     
     except Exception as e:
         logger.error(f"Hata: {e}")
-        await status_msg.edit_text(f"❌ Beklenmeyen bir hata oluştu:\n{str(e)}")
+        await progress.complete(success=False, details=str(e))
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -177,7 +340,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # MIME type kontrolü
     if not doc.mime_type or not doc.mime_type.startswith('image/'):
-        await update.message.reply_text("⚠️ Lütfen sadece görüntü dosyası gönderin.")
+        await update.message.reply_text(
+            "⚠️ **Hata:** Lütfen sadece görüntü dosyası gönderin.",
+            parse_mode="Markdown"
+        )
         return
     
     logger.info("Doküman alındı.")
