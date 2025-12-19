@@ -2,11 +2,12 @@
 Telegram Bot Modülü
 Kullanıcıdan gelen fotoğrafları dinler, Gemini ile işler ve sonucu geri gönderir.
 Modern ve detaylı adım adım geri bildirimler sağlar.
+Çoklu görsel oluşturma desteği.
 """
 
 import os
 import time
-from typing import Optional, Callable
+from typing import Optional
 from dataclasses import dataclass
 
 from telegram import Update, Message
@@ -14,6 +15,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    ConversationHandler,
     filters,
     ContextTypes,
 )
@@ -25,6 +27,9 @@ from core.exceptions import AutomationError
 from services.gemini_service import GeminiService
 
 logger = get_logger(__name__)
+
+# Conversation states
+WAITING_FOR_COUNT = 1
 
 
 @dataclass
@@ -46,39 +51,47 @@ class ProgressTracker:
         StepInfo("🧠", "AI analiz yapıyor"),
         StepInfo("⏳", "Yanıt bekleniyor"),
         StepInfo("💬", "Prompt alındı"),
-        StepInfo("🆕", "Yeni sohbet açılıyor"),
-        StepInfo("🎨", "Görsel oluşturuluyor"),
-        StepInfo("⬇️", "Görsel indiriliyor"),
-        StepInfo("📨", "Sonuç gönderiliyor"),
     ]
     
-    def __init__(self, message: Message):
+    def __init__(self, message: Message, total_images: int = 1):
         self.message = message
         self.current_step = 0
         self.start_time = time.time()
         self.extra_info = ""
+        self.total_images = total_images
+        self.current_image = 0
+        self.completed_images = 0
     
     def _build_message(self) -> str:
         """İlerleme mesajını oluştur"""
-        lines = ["🤖 **AI Görsel Otomasyon**", "━" * 24, ""]
+        lines = ["🤖 **AI Görsel Otomasyon**", "━" * 24]
+        
+        # Çoklu görsel bilgisi
+        if self.total_images > 1:
+            lines.append(f"🎯 Hedef: **{self.total_images} görsel**")
+            if self.current_image > 0:
+                lines.append(f"📸 İşleniyor: Görsel {self.current_image}/{self.total_images}")
+            if self.completed_images > 0:
+                lines.append(f"✅ Tamamlanan: {self.completed_images}/{self.total_images}")
+            lines.append("")
         
         for i, step in enumerate(self.STEPS):
             if i < self.current_step:
-                # Tamamlanmış adım
                 lines.append(f"{step.done_emoji} ~~{step.name}~~")
             elif i == self.current_step:
-                # Aktif adım
                 lines.append(f"▶️ **{step.name}...**")
             else:
-                # Bekleyen adım
                 lines.append(f"⬜ {step.name}")
         
-        # Ekstra bilgi
+        # Görsel oluşturma adımları (prompt alındıktan sonra)
+        if self.current_step >= 7 and self.current_image > 0:
+            lines.append("")
+            lines.append(f"🎨 **Görsel {self.current_image} oluşturuluyor...**")
+        
         if self.extra_info:
             lines.append("")
             lines.append(f"💡 _{self.extra_info}_")
         
-        # Geçen süre
         elapsed = int(time.time() - self.start_time)
         lines.append("")
         lines.append(f"⏱️ Geçen süre: {elapsed}s")
@@ -98,23 +111,48 @@ class ProgressTracker:
         except Exception as e:
             logger.debug(f"Mesaj güncellenemedi: {e}")
     
+    async def set_current_image(self, num: int):
+        """Şu anki görsel numarasını ayarla"""
+        self.current_image = num
+        await self.update(7, f"Görsel {num}/{self.total_images} için yeni sohbet açılıyor...")
+    
+    async def image_completed(self):
+        """Bir görsel tamamlandı"""
+        self.completed_images += 1
+        await self.update(7, f"{self.completed_images}/{self.total_images} görsel hazır!")
+    
     async def complete(self, success: bool, details: str = ""):
         """İşlemi tamamla"""
         elapsed = int(time.time() - self.start_time)
         
         if success:
-            text = (
-                "🎉 **İŞLEM TAMAMLANDI!**\n"
-                "━" * 24 + "\n\n"
-                "✅ Tüm adımlar başarıyla tamamlandı\n\n"
-                f"⏱️ Toplam süre: **{elapsed} saniye**\n\n"
-                "📎 Görseliniz aşağıda 👇"
-            )
+            if self.total_images > 1:
+                text = (
+                    f"🎉 **{self.total_images} GÖRSEL OLUŞTURULDU!**\n"
+                    "━" * 24 + "\n\n"
+                    f"✅ Tüm görseller başarıyla oluşturuldu\n\n"
+                    f"⏱️ Toplam süre: **{elapsed} saniye**\n"
+                    f"⚡ Ortalama: **{elapsed // self.total_images}s/görsel**\n\n"
+                    "📎 Görselleriniz aşağıda 👇"
+                )
+            else:
+                text = (
+                    "🎉 **İŞLEM TAMAMLANDI!**\n"
+                    "━" * 24 + "\n\n"
+                    "✅ Görsel başarıyla oluşturuldu\n\n"
+                    f"⏱️ Toplam süre: **{elapsed} saniye**\n\n"
+                    "📎 Görseliniz aşağıda 👇"
+                )
         else:
+            completed_info = ""
+            if self.completed_images > 0:
+                completed_info = f"\n✅ {self.completed_images} görsel başarıyla oluşturuldu\n"
+            
             text = (
                 "❌ **İŞLEM BAŞARISIZ**\n"
                 "━" * 24 + "\n\n"
-                f"⚠️ {details}\n\n"
+                f"⚠️ {details}\n"
+                f"{completed_info}\n"
                 f"⏱️ Geçen süre: {elapsed}s\n\n"
                 "🔄 Tekrar denemek için yeni bir fotoğraf gönderin."
             )
@@ -158,12 +196,12 @@ class TelegramBotService:
             logger.error(f"Tarayıcı başlatılamadı: {e}")
             return False
     
-    async def process_image_with_progress(
+    async def analyze_image_and_get_prompt(
         self,
         image_path: str,
         progress: ProgressTracker
     ) -> Optional[str]:
-        """Fotoğrafı işle ve ilerlemeyi takip et"""
+        """Fotoğrafı analiz et ve prompt al"""
         
         # Tarayıcı kontrolü
         if not await self.ensure_browser(progress):
@@ -189,30 +227,77 @@ class TelegramBotService:
             # Adım 6: Prompt al
             await progress.update(6, "AI prompt alınıyor...")
             response_text = self.gemini_service.get_response_text()
-            if not response_text:
-                raise AutomationError("Yanıt alınamadı")
             
-            # Adım 7: Yeni sohbet
-            await progress.update(7, "Görsel oluşturma için hazırlanıyor...")
+            return response_text
+            
+        except AutomationError as e:
+            logger.error(f"Analiz hatası: {e}")
+            return None
+    
+    async def generate_single_image(
+        self,
+        prompt: str,
+        image_num: int,
+        progress: ProgressTracker
+    ) -> Optional[str]:
+        """Tek bir görsel oluştur"""
+        
+        try:
+            await progress.set_current_image(image_num)
+            
+            # Yeni sohbet
             self.gemini_service.start_new_chat()
             
-            # Adım 8: Görsel oluştur
-            await progress.update(8, "Görsel oluşturma promptu gönderiliyor...")
-            self.gemini_service.send_prompt(response_text)
+            # Görsel oluştur
+            await progress.update(7, f"Görsel {image_num}: Prompt gönderiliyor...")
+            self.gemini_service.send_prompt(prompt)
             
-            # Adım 9: Görsel bekle
-            await progress.update(9, "AI görsel oluşturuyor (bu biraz sürebilir)...")
+            # Görsel bekle
+            await progress.update(7, f"Görsel {image_num}: AI oluşturuyor...")
             self.gemini_service.wait_for_image_generation(timeout=180)
             
-            # Adım 10: İndir
-            await progress.update(9, "Görsel indiriliyor...")
+            # İndir
+            await progress.update(7, f"Görsel {image_num}: İndiriliyor...")
             result = self.gemini_service.download_generated_image()
+            
+            if result:
+                await progress.image_completed()
             
             return result
             
         except AutomationError as e:
-            logger.error(f"İşlem hatası: {e}")
+            logger.error(f"Görsel {image_num} oluşturma hatası: {e}")
             return None
+    
+    async def process_image_with_progress(
+        self,
+        image_path: str,
+        image_count: int,
+        progress: ProgressTracker
+    ) -> tuple:
+        """Fotoğrafı işle ve birden fazla görsel oluştur
+        
+        Returns:
+            (results, prompt) - Oluşturulan görsellerin yolları ve kullanılan prompt
+        """
+        
+        results = []
+        
+        # Önce prompt'u al
+        prompt = await self.analyze_image_and_get_prompt(image_path, progress)
+        
+        if not prompt:
+            return results, None
+        
+        logger.info(f"Prompt alındı, {image_count} görsel oluşturulacak")
+        
+        # Her görsel için ayrı ayrı oluştur
+        for i in range(1, image_count + 1):
+            result = await self.generate_single_image(prompt, i, progress)
+            if result:
+                results.append(result)
+        
+        return results, prompt
     
     @property
     def browser_status(self) -> str:
@@ -234,14 +319,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📸 **Nasıl Çalışır?**
 1️⃣ Bana bir fotoğraf gönder
-2️⃣ AI fotoğrafı analiz eder
-3️⃣ Detaylı bir prompt oluşturur
-4️⃣ Bu promptla yeni görsel üretir
-5️⃣ Sonucu sana gönderir
+2️⃣ Kaç adet görsel istediğini belirt (1-9)
+3️⃣ AI fotoğrafı analiz eder
+4️⃣ İstediğin sayıda görsel üretir
+5️⃣ Hepsini sana gönderir
 
 ⚡ **Komutlar:**
 /start - Bu mesajı göster
 /status - Bot durumunu kontrol et
+/cancel - İşlemi iptal et
 
 🎯 Hadi başlayalım! Bir fotoğraf gönder.
 """
@@ -263,94 +349,173 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status_text, parse_mode="Markdown")
 
 
-async def process_input_image(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    file_obj,
-    file_name: str
-):
-    """Ortak işlem fonksiyonu: fotoğraf ve belge için"""
-    
-    # İlerleme takipçisi başlat
-    status_msg = await update.message.reply_text(
-        "🚀 **İşlem başlatılıyor...**",
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """İşlemi iptal et"""
+    context.user_data.clear()
+    await update.message.reply_text(
+        "❌ İşlem iptal edildi.\n\n"
+        "🔄 Yeni bir fotoğraf göndererek tekrar başlayabilirsiniz.",
         parse_mode="Markdown"
     )
-    progress = ProgressTracker(status_msg)
-    
-    try:
-        # Adım 0: Dosyayı indir
-        await progress.update(0, "Telegram'dan indiriliyor...")
-        file_path = os.path.join(config.IMAGES_DIR, file_name)
-        await file_obj.download_to_drive(file_path)
-        logger.info(f"Fotoğraf kaydedildi: {file_path}")
-        
-        # İşlemi başlat
-        result_image = await bot_service.process_image_with_progress(
-            file_path, progress
-        )
-        
-        if result_image and os.path.exists(result_image):
-            # Adım 10: Gönder
-            await progress.update(10, "Telegram'a yükleniyor...")
-            
-            # Tamamlandı mesajı
-            await progress.complete(success=True)
-            
-            # Dosya olarak gönder (kalite bozulmaz)
-            with open(result_image, 'rb') as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=os.path.basename(result_image),
-                    caption="🎨 **Orijinal Kalite**\nTam çözünürlüklü görsel",
-                    parse_mode="Markdown"
-                )
-            
-            # Önizleme gönder
-            with open(result_image, 'rb') as f:
-                await update.message.reply_photo(
-                    photo=f,
-                    caption="👆 _Önizleme - Orijinal için dosyaya bakın_",
-                    parse_mode="Markdown"
-                )
-        else:
-            await progress.complete(
-                success=False,
-                details="Görsel oluşturulamadı veya indirilemedi"
-            )
-    
-    except Exception as e:
-        logger.error(f"Hata: {e}")
-        await progress.complete(success=False, details=str(e))
+    return ConversationHandler.END
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Normal fotoğraf mesajlarını karşılar"""
-    logger.info("Fotoğraf alındı.")
+    """Fotoğraf alındığında sayı sor"""
+    logger.info("Fotoğraf alındı, sayı bekleniyor...")
+    
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     filename = f"photo_{update.message.message_id}.jpg"
     
-    await process_input_image(update, context, file, filename)
+    # Dosyayı kaydet
+    file_path = os.path.join(config.IMAGES_DIR, filename)
+    await file.download_to_drive(file_path)
+    
+    # Kullanıcı verisine kaydet
+    context.user_data['image_path'] = file_path
+    context.user_data['filename'] = filename
+    
+    await update.message.reply_text(
+        "📸 **Fotoğraf alındı!**\n\n"
+        "🔢 Kaç adet görsel oluşturmak istiyorsunuz?\n\n"
+        "_(1-9 arası bir sayı girin)_\n\n"
+        "💡 Örnek: `3` yazarsanız 3 farklı görsel oluşturulur",
+        parse_mode="Markdown"
+    )
+    
+    return WAITING_FOR_COUNT
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Dosya olarak gönderilen fotoğrafları karşılar"""
     doc = update.message.document
     
-    # MIME type kontrolü
     if not doc.mime_type or not doc.mime_type.startswith('image/'):
         await update.message.reply_text(
             "⚠️ **Hata:** Lütfen sadece görüntü dosyası gönderin.",
             parse_mode="Markdown"
         )
-        return
+        return ConversationHandler.END
     
-    logger.info("Doküman alındı.")
+    logger.info("Doküman alındı, sayı bekleniyor...")
+    
     file = await context.bot.get_file(doc.file_id)
     filename = doc.file_name or f"doc_{update.message.message_id}.jpg"
     
-    await process_input_image(update, context, file, filename)
+    # Dosyayı kaydet
+    file_path = os.path.join(config.IMAGES_DIR, filename)
+    await file.download_to_drive(file_path)
+    
+    # Kullanıcı verisine kaydet
+    context.user_data['image_path'] = file_path
+    context.user_data['filename'] = filename
+    
+    await update.message.reply_text(
+        "📸 **Fotoğraf alındı!**\n\n"
+        "🔢 Kaç adet görsel oluşturmak istiyorsunuz?\n\n"
+        "_(1-9 arası bir sayı girin)_\n\n"
+        "💡 Örnek: `3` yazarsanız 3 farklı görsel oluşturulur",
+        parse_mode="Markdown"
+    )
+    
+    return WAITING_FOR_COUNT
+
+
+async def handle_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Görsel sayısını al ve işlemi başlat"""
+    text = update.message.text.strip()
+    
+    # Sayı kontrolü
+    try:
+        count = int(text)
+        if count < 1 or count > 9:
+            raise ValueError("Geçersiz aralık")
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ **Geçersiz sayı!**\n\n"
+            "Lütfen 1-9 arası bir sayı girin.\n\n"
+            "_Örnek: 1, 3, 5, 9_",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_COUNT
+    
+    # Dosya yolunu al
+    image_path = context.user_data.get('image_path')
+    if not image_path or not os.path.exists(image_path):
+        await update.message.reply_text(
+            "❌ **Hata:** Fotoğraf bulunamadı.\n\n"
+            "Lütfen tekrar bir fotoğraf gönderin.",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    
+    # Onay mesajı
+    await update.message.reply_text(
+        f"✅ **{count} görsel** oluşturulacak!\n\n"
+        "🚀 İşlem başlatılıyor...",
+        parse_mode="Markdown"
+    )
+    
+    # İlerleme takipçisi başlat
+    status_msg = await update.message.reply_text(
+        "🔄 **Hazırlanıyor...**",
+        parse_mode="Markdown"
+    )
+    progress = ProgressTracker(status_msg, total_images=count)
+    
+    try:
+        await progress.update(0, "Başlatılıyor...")
+        
+        # İşlemi başlat
+        results, used_prompt = await bot_service.process_image_with_progress(
+            image_path, count, progress
+        )
+        
+        if results:
+            await progress.complete(success=True)
+            
+            # Her görseli gönder
+            for i, result_path in enumerate(results, 1):
+                if os.path.exists(result_path):
+                    with open(result_path, 'rb') as f:
+                        await update.message.reply_document(
+                            document=f,
+                            filename=os.path.basename(result_path),
+                            caption=f"🎨 **Görsel {i}/{len(results)}**",
+                            parse_mode="Markdown"
+                        )
+                    
+                    with open(result_path, 'rb') as f:
+                        await update.message.reply_photo(
+                            photo=f,
+                            caption=f"👆 _Önizleme {i}/{len(results)}_",
+                            parse_mode="Markdown"
+                        )
+            
+            # Kullanılan prompt'u gönder
+            if used_prompt:
+                # Prompt çok uzunsa kısalt
+                prompt_display = used_prompt[:3500] if len(used_prompt) > 3500 else used_prompt
+                await update.message.reply_text(
+                    f"📝 **Kullanılan Prompt:**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"`{prompt_display}`",
+                    parse_mode="Markdown"
+                )
+        else:
+            await progress.complete(
+                success=False,
+                details="Görsel oluşturulamadı"
+            )
+    
+    except Exception as e:
+        logger.error(f"Hata: {e}")
+        await progress.complete(success=False, details=str(e))
+    
+    # Temizlik
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
 def run_bot():
@@ -369,11 +534,26 @@ def run_bot():
     # Application oluştur
     application = Application.builder().token(config.BOT_TOKEN).build()
     
+    # Conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.PHOTO, handle_photo),
+            MessageHandler(filters.Document.IMAGE, handle_document),
+        ],
+        states={
+            WAITING_FOR_COUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_count),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+        ],
+    )
+    
     # Handler'ları ekle
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(conv_handler)
     
     # Bot'u çalıştır
     logger.info("Bot çalışıyor! Fotoğraf bekleniyor...")
