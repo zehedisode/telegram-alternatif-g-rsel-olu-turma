@@ -41,6 +41,9 @@ class GeminiService:
         'model_response': 'model-response',
         'copy_button': 'button[aria-label="Kopyala"]',
         'image_button': 'button.image-button img, .generated-image img',
+        'tools_button': 'button.toolbox-drawer-button',
+        'image_generation_option': 'button.toolbox-drawer-item-list-button',
+        'thoughts_button': 'button.thoughts-header-button',
         'new_chat_selectors': [
             'button[aria-label="Yeni sohbet"]',
             'button[aria-label="New chat"]',
@@ -215,7 +218,7 @@ class GeminiService:
             raise ResponseError("Cevap beklenirken hata", details=str(e))
     
     def get_response_text(self) -> Optional[str]:
-        """Son cevabı al"""
+        """Son cevabı al - 'Düşünme sürecini göster' butonunu hariç tutar"""
         logger.info("Cevap metni alınıyor...")
         
         try:
@@ -223,7 +226,22 @@ class GeminiService:
                 By.CSS_SELECTOR, self.SELECTORS['model_response']
             )
             if responses:
-                text_content = responses[-1].text
+                # JavaScript ile sadece asıl içeriği al, düşünme butonunu hariç tut
+                text_content = self.driver.execute_script("""
+                    const response = arguments[0];
+                    const clone = response.cloneNode(true);
+                    
+                    // Düşünme sürecini göster butonunu kaldır
+                    const thoughtsButtons = clone.querySelectorAll('.thoughts-header-button, button.thoughts-header-button');
+                    thoughtsButtons.forEach(btn => btn.remove());
+                    
+                    // Düşünme içeriğini de kaldır (varsa)
+                    const thoughtsContent = clone.querySelectorAll('.thoughts-content, .thinking-content');
+                    thoughtsContent.forEach(content => content.remove());
+                    
+                    return clone.innerText.trim();
+                """, responses[-1])
+                
                 logger.info(f"Cevap alındı: {text_content[:100]}...")
                 return text_content
             
@@ -252,6 +270,99 @@ class GeminiService:
                 "Görsel oluşturulamadı veya timeout",
                 details=str(e)
             )
+    
+    def select_image_generation_tool(self) -> bool:
+        """
+        Araçlar menüsünden 'Görüntü oluşturun' seçeneğini seç.
+        Bu, görsel oluşturma promptu göndermeden önce çağrılmalıdır.
+        """
+        logger.info("Görüntü oluşturma aracı seçiliyor...")
+        
+        try:
+            wait = WebDriverWait(self.driver, 15)
+            
+            # Sayfa yüklenene kadar bekle
+            time.sleep(2)
+            
+            # Araçlar butonunu bul
+            tools_selectors = [
+                'button.toolbox-drawer-button',
+                'button[class*="toolbox-drawer"]',
+                'button.toolbox-drawer-button-with-label',
+            ]
+            
+            tools_button = None
+            for selector in tools_selectors:
+                try:
+                    tools_button = wait.until(EC.element_to_be_clickable(
+                        (By.CSS_SELECTOR, selector)
+                    ))
+                    break
+                except Exception:
+                    continue
+            
+            if not tools_button:
+                logger.error("Araçlar butonu bulunamadı!")
+                return False
+            
+            # Araçlar butonuna tıkla
+            self.driver.execute_script("arguments[0].click();", tools_button)
+            time.sleep(2)  # Menünün açılmasını bekle
+            
+            # Görüntü oluşturun seçeneğini bul
+            option_selectors = [
+                'button.toolbox-drawer-item-list-button',
+                'button[class*="toolbox-drawer-item"]',
+                '.mat-mdc-list-item button',
+            ]
+            
+            options = []
+            for selector in option_selectors:
+                options = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if options:
+                    break
+            
+            if not options:
+                logger.error("Menü seçenekleri bulunamadı!")
+                return False
+            
+            # Görüntü oluşturun metnini içeren seçeneği bul
+            for option in options:
+                option_text = option.text.strip()
+                
+                if 'Görüntü oluşturun' in option_text or 'görüntü oluştur' in option_text.lower():
+                    self.driver.execute_script("arguments[0].click();", option)
+                    time.sleep(1)
+                    logger.info("✓ Görüntü oluşturma aracı seçildi!")
+                    return True
+                
+                # İngilizce de kontrol et
+                if 'create image' in option_text.lower():
+                    self.driver.execute_script("arguments[0].click();", option)
+                    time.sleep(1)
+                    logger.info("✓ Görüntü oluşturma aracı seçildi!")
+                    return True
+            
+            # Fallback: Görüntü oluşturun genellikle 3. sırada (0-indexed: 2)
+            if len(options) > 2:
+                target_option = options[2]
+                self.driver.execute_script("arguments[0].click();", target_option)
+                time.sleep(1)
+                logger.info("✓ Görüntü oluşturma aracı seçildi (fallback)")
+                return True
+            elif options:
+                target_option = options[0]
+                self.driver.execute_script("arguments[0].click();", target_option)
+                time.sleep(1)
+                logger.info("✓ Görüntü oluşturma aracı seçildi (fallback)")
+                return True
+            
+            logger.error("Görüntü oluşturma seçeneği bulunamadı!")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Görüntü oluşturma aracı seçilemedi: {e}")
+            return False
     
     def download_generated_image(self) -> Optional[str]:
         """Oluşturulan görseli indir"""
@@ -292,13 +403,16 @@ class GeminiService:
         # 6. Yeni sohbet başlat
         self.start_new_chat()
         
-        # 7. Görsel oluşturma promptunu gönder
+        # 7. Görüntü oluşturma aracını seç
+        self.select_image_generation_tool()
+        
+        # 8. Görsel oluşturma promptunu gönder
         self.send_prompt(response_text)
         
-        # 8. Görsel oluşturulmasını bekle
+        # 9. Görsel oluşturulmasını bekle
         self.wait_for_image_generation(timeout=180)
         
-        # 9. Görseli indir
+        # 10. Görseli indir
         downloaded_image = self.download_generated_image()
         
         if downloaded_image:

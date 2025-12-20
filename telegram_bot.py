@@ -248,6 +248,10 @@ class TelegramBotService:
             # Yeni sohbet
             self.gemini_service.start_new_chat()
             
+            # Görüntü oluşturma aracını seç
+            await progress.update(7, f"Görsel {image_num}: Araç seçiliyor...")
+            self.gemini_service.select_image_generation_tool()
+            
             # Görsel oluştur
             await progress.update(7, f"Görsel {image_num}: Prompt gönderiliyor...")
             self.gemini_service.send_prompt(prompt)
@@ -305,6 +309,18 @@ class TelegramBotService:
         if self.browser_manager and self.browser_manager.is_running:
             return "✅ Aktif"
         return "❌ Kapalı"
+    
+    def close_browser(self):
+        """Tarayıcıyı kapat"""
+        if self.browser_manager:
+            try:
+                self.browser_manager.close()
+                logger.info("Tarayıcı kapatıldı")
+            except Exception as e:
+                logger.warning(f"Tarayıcı kapatılırken hata: {e}")
+            finally:
+                self.browser_manager = None
+                self.gemini_service = None
 
 
 # Global servis instance
@@ -515,6 +531,10 @@ async def handle_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Temizlik
     context.user_data.clear()
+    
+    # Tarayıcıyı kapat
+    bot_service.close_browser()
+    
     return ConversationHandler.END
 
 
